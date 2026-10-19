@@ -9,7 +9,7 @@ on:
 env:
   ACR_NAME: kyndrylacrlab
   IMAGE_NAME: back-retos
-  APP_SERVICE_NAME: app-back-retos
+  APP_SERVICE_NAME: app-kyndryl-jose
   RESOURCE_GROUP: kyndrylresource
 
 jobs:
