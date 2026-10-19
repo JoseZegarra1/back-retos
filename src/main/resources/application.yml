@@ -1,0 +1,53 @@
+server:
+  port: ${PORT:8080}
+
+spring:
+  application:
+    name: retos-tecnicos
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://retos-pg-jose.postgres.database.azure.com:5432/retos?sslmode=require}
+    username: ${DB_USER:retosadmin}
+    password: ${DB_PASSWORD:admin12345}
+  jpa:
+    hibernate:
+      ddl-auto: ${DDL_AUTO:update}
+    open-in-view: false
+  servlet:
+    multipart:
+      max-file-size: ${MAX_UPLOAD:200MB}
+      max-request-size: ${MAX_UPLOAD:200MB}
+  mail:
+    host: ${SMTP_HOST:}
+    port: ${SMTP_PORT:587}
+    username: ${SMTP_USER:}
+    password: ${SMTP_PASSWORD:}
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+
+storage:
+  type: ${STORAGE_TYPE:azure}
+  azure:
+    connection-string: ${AZURE_STORAGE_CONNECTION_STRING:DefaultEndpointsProtocol=https;EndpointSuffix=core.windows.net;AccountName=retostecnicosjose;AccountKey=/KozGaMSqFs7QNiSvb9BFHnhoUpUz5Qi1nNcaRONH6wK4rUaXa9G9Jt0fc9uFmEYYejN9WX+cgeS+AStdrsYMA==;BlobEndpoint=https://retostecnicosjose.blob.core.windows.net/}
+    container: ${AZURE_STORAGE_CONTAINER:retos}
+  local:
+    root: ${STORAGE_LOCAL_ROOT:./storage-local}
+
+app:
+  timezone: America/Lima
+  jwt:
+    secret: ${JWT_SECRET:cambia-este-secreto-por-uno-de-minimo-32-caracteres!}
+    ttl-minutes: 480
+  cors:
+    allowed-origins: ${CORS_ORIGINS:http://localhost:4200}
+  challenge:
+    duration-minutes: 180
+    grace-seconds: 60
+    expire-check-ms: 30000
+  notification:
+    from: ${MAIL_FROM:no-reply@retos.local}
+    extra-recipients: ${GHD_EXTRA_EMAILS:}
+  seed:
+    admin-password: ${ADMIN_PASSWORD:Admin123!}
+    ghd-password: ${GHD_PASSWORD:Ghd12345!}
+    ghd-email: ${GHD_EMAIL:}
