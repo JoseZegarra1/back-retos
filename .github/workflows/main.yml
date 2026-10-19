@@ -1,4 +1,4 @@
-name: Build and Push Image to ACR
+name: CI-CD to ACR and App Service
 
 on:
   push:
@@ -9,13 +9,17 @@ on:
 env:
   ACR_NAME: kyndrylacrlab
   IMAGE_NAME: back-retos
+  APP_SERVICE_NAME: app-back-retos
+  RESOURCE_GROUP: kyndrylresource
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-
     permissions:
       contents: read
+
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
 
     steps:
       - name: Checkout repository
@@ -48,3 +52,41 @@ jobs:
         run: |
           echo "Image published:"
           echo "${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}"
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Configure container port
+        run: |
+          az webapp config appsettings set \
+            --name "${{ env.APP_SERVICE_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --settings WEBSITES_PORT=8080
+
+      - name: Configure Web App container
+        run: |
+          az webapp config container set \
+            --name "${{ env.APP_SERVICE_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --docker-custom-image-name "${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image_tag }}" \
+            --docker-registry-server-url "https://${{ env.ACR_NAME }}.azurecr.io"
+
+      - name: Deploy Docker image to App Service
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.APP_SERVICE_NAME }}
+          images: ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image_tag }}
+
+      - name: Restart Web App
+        run: |
+          az webapp restart \
+            --name "${{ env.APP_SERVICE_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}"
