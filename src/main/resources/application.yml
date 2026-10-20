@@ -5,9 +5,9 @@ spring:
   application:
     name: retos-tecnicos
   datasource:
-    url: ${DB_URL:jdbc:h2:mem:retos;DB_CLOSE_DELAY=-1}
-    username: ${DB_USER:sa}
-    password: ${DB_PASSWORD:}
+    url: ${DB_URL:jdbc:postgresql://retos-pg-jose.postgres.database.azure.com:5432/retos?sslmode=require}
+    username: ${DB_USER:retosadmin}
+    password: ${DB_PASSWORD:admin12345}
   jpa:
     hibernate:
       ddl-auto: ${DDL_AUTO:update}
