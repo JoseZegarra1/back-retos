@@ -32,6 +32,10 @@ public class Challenge {
     @Column(nullable = false)
     private Instant assignedAt = Instant.now();
 
+    /** Duracion propia del reto. Null en retos creados antes de este campo: se usa app.challenge.duration-minutes. */
+    @Column(name = "duration_minutes")
+    private Integer durationMinutes;
+
     private Instant startedAt;
     private Instant deadlineAt;
     private Instant submittedAt;
@@ -63,6 +67,9 @@ public class Challenge {
     public void setLevel(Level level) { this.level = level; }
     public ChallengeStatus getStatus() { return status; }
     public void setStatus(ChallengeStatus status) { this.status = status; }
+    public Integer getDurationMinutes() { return durationMinutes; }
+    public void setDurationMinutes(Integer durationMinutes) { this.durationMinutes = durationMinutes; }
+    public int durationOr(int defaultMinutes) { return durationMinutes != null ? durationMinutes : defaultMinutes; }
     public Instant getAssignedAt() { return assignedAt; }
     public Instant getStartedAt() { return startedAt; }
     public void setStartedAt(Instant startedAt) { this.startedAt = startedAt; }

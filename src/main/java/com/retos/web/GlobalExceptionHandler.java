@@ -30,9 +30,11 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<Map<String, String>> validation(MethodArgumentNotValidException ex) {
+        // Cada restriccion de Dtos trae un mensaje completo en espanol; se devuelven sin el nombre tecnico del campo
         String msg = ex.getBindingResult().getFieldErrors().stream()
-                .map(e -> e.getField() + ": " + e.getDefaultMessage())
-                .collect(Collectors.joining("; "));
+                .map(e -> e.getDefaultMessage())
+                .distinct()
+                .collect(Collectors.joining(". "));
         return ResponseEntity.badRequest().body(Map.of("message", msg));
     }
 

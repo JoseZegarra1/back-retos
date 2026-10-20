@@ -12,15 +12,21 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.EnumSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.web.multipart.MultipartFile;
 
 @Service
@@ -28,29 +34,47 @@ public class ChallengeService {
 
     private static final Logger log = LoggerFactory.getLogger(ChallengeService.class);
 
+    private static final Set<ChallengeStatus> PENDING = EnumSet.of(ChallengeStatus.ASSIGNED, ChallengeStatus.IN_PROGRESS);
+
+    private static final Map<Track, String> TRACK_LABEL = Map.of(Track.DEVOPS, "DevOps", Track.DATA, "Data");
+    private static final Map<Level, String> LEVEL_LABEL = Map.of(
+            Level.PRINCIPIANTE, "Principiante", Level.COMPETENTE, "Competente",
+            Level.PROFICIENTE, "Proficiente", Level.MASTER, "Master");
+    private static final Map<ChallengeStatus, String> STATUS_LABEL = Map.of(
+            ChallengeStatus.ASSIGNED, "Asignado", ChallengeStatus.IN_PROGRESS, "En curso",
+            ChallengeStatus.SUBMITTED, "Entregado", ChallengeStatus.EXPIRED, "Vencido sin entrega",
+            ChallengeStatus.GRADED, "Calificado");
+
     public record DownloadFile(InputStream stream, String filename) {}
 
     private final ChallengeRepository challenges;
     private final UserRepository users;
     private final StorageService storage;
     private final NotificationService notifications;
-    private final Duration duration;
+    private final int defaultMinutes;
     private final Duration grace;
     private final DateTimeFormatter fmt;
+    private final String baseUrl;
 
     public ChallengeService(ChallengeRepository challenges, UserRepository users, StorageService storage,
                             NotificationService notifications,
-                            @Value("${app.challenge.duration-minutes:180}") long durationMinutes,
+                            @Value("${app.challenge.duration-minutes:180}") int defaultMinutes,
                             @Value("${app.challenge.grace-seconds:60}") long graceSeconds,
-                            @Value("${app.timezone:America/Lima}") String zone) {
+                            @Value("${app.timezone:America/Lima}") String zone,
+                            @Value("${app.base-url:}") String baseUrl) {
         this.challenges = challenges;
         this.users = users;
         this.storage = storage;
         this.notifications = notifications;
-        this.duration = Duration.ofMinutes(durationMinutes);
+        this.defaultMinutes = defaultMinutes;
         this.grace = Duration.ofSeconds(graceSeconds);
         this.fmt = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss", Locale.forLanguageTag("es"))
                 .withZone(ZoneId.of(zone));
+        this.baseUrl = baseUrl == null ? "" : baseUrl.replaceAll("/+$", "");
+    }
+
+    public int defaultMinutes() {
+        return defaultMinutes;
     }
 
     // ---------- rutas en el Storage Account ----------
@@ -72,60 +96,141 @@ public class ChallengeService {
         List<Challenge> list = actor.getRole() == Role.USER
                 ? challenges.findByCandidateOrderByAssignedAtDesc(actor)
                 : challenges.findAllByOrderByAssignedAtDesc();
-        return list.stream().map(ChallengeDto::of).toList();
+        return list.stream().map(this::dto).toList();
     }
 
     @Transactional(readOnly = true)
     public ChallengeDto get(Long id, AppUser actor) {
         Challenge c = find(id);
         checkCanView(c, actor);
-        return ChallengeDto.of(c);
+        return dto(c);
     }
 
     // ---------- GHD asigna ----------
 
+    /**
+     * Asigna uno o varios niveles del mismo modulo. Es atomico: primero se validan todos los niveles
+     * y solo si todos son validos se crean los retos.
+     */
     @Transactional
-    public ChallengeDto assign(AssignRequest req, AppUser actor) {
+    public List<ChallengeDto> assign(AssignRequest req, AppUser actor) {
         AppUser candidate = users.findById(req.candidateId())
                 .orElseThrow(() -> ApiException.notFound("Candidato no encontrado"));
         if (candidate.getRole() != Role.USER || !candidate.isActive()) {
             throw ApiException.badRequest("El candidato debe ser un usuario activo con rol USER");
         }
-        if (!req.track().supports(req.level())) {
-            throw ApiException.badRequest("El reto " + req.track() + " no tiene nivel " + req.level()
-                    + ". Niveles validos: " + req.track().levels());
+        Track track = req.track();
+        Set<Level> levels = requestedLevels(req);
+
+        if (challenges.existsByCandidateAndTrackNot(candidate, track)) {
+            Track other = track == Track.DEVOPS ? Track.DATA : Track.DEVOPS;
+            throw ApiException.conflict("El candidato ya tiene retos del modulo " + other
+                    + "; solo se le pueden asignar retos de ese mismo modulo");
         }
-        if (challenges.existsByCandidateAndStatusIn(candidate,
-                EnumSet.of(ChallengeStatus.ASSIGNED, ChallengeStatus.IN_PROGRESS))) {
-            throw ApiException.conflict("El candidato ya tiene un reto pendiente o en curso");
+        for (Level level : levels) {
+            if (!track.supports(level)) {
+                throw ApiException.badRequest("El reto " + track + " no tiene nivel " + level
+                        + ". Niveles validos: " + track.levels());
+            }
+            if (challenges.existsByCandidateAndTrackAndLevelAndStatusIn(candidate, track, level, PENDING)) {
+                throw ApiException.conflict("El candidato ya tiene asignado el reto "
+                        + track + " - " + level + " en estado pendiente o en curso");
+            }
+            if (!storage.exists(templatePath(track, level))) {
+                throw ApiException.conflict("Aun no se ha cargado la carpeta de codigo para "
+                        + track + " / " + level + ". Pidale a un administrador que la suba.");
+            }
         }
-        if (!storage.exists(templatePath(req.track(), req.level()))) {
-            throw ApiException.conflict("Aun no se ha cargado la carpeta de codigo para "
-                    + req.track() + " / " + req.level() + ". Pidale a un administrador que la suba.");
+
+        int minutes = req.durationMinutes() != null ? req.durationMinutes() : defaultMinutes;
+        List<Challenge> created = new ArrayList<>();
+        for (Level level : levels) {
+            Challenge c = new Challenge();
+            c.setCandidate(candidate);
+            c.setAssignedBy(actor);
+            c.setTrack(track);
+            c.setLevel(level);
+            c.setDurationMinutes(minutes);
+            created.add(challenges.save(c));
         }
-        Challenge c = new Challenge();
-        c.setCandidate(candidate);
-        c.setAssignedBy(actor);
-        c.setTrack(req.track());
-        c.setLevel(req.level());
-        return ChallengeDto.of(challenges.save(c));
+        return created.stream().map(this::dto).toList();
+    }
+
+    /** Une {@code level} (formato anterior) y {@code levels}; rechaza listas vacias o con repetidos. */
+    private static Set<Level> requestedLevels(AssignRequest req) {
+        Set<Level> levels = new LinkedHashSet<>();
+        if (req.level() != null) {
+            levels.add(req.level());
+        }
+        if (req.levels() != null) {
+            Set<Level> seen = EnumSet.noneOf(Level.class);
+            for (Level l : req.levels()) {
+                if (!seen.add(l)) {
+                    throw ApiException.badRequest("El nivel " + l + " esta repetido en la solicitud");
+                }
+            }
+            levels.addAll(seen);
+        }
+        if (levels.isEmpty()) {
+            throw ApiException.badRequest("Selecciona al menos un nivel");
+        }
+        return levels;
+    }
+
+    // ---------- GHD / ADMIN: duracion ----------
+
+    /**
+     * ASSIGNED: solo cambia la duracion. IN_PROGRESS: recalcula el limite desde el inicio
+     * (sirve para dar mas tiempo). Estados finales: 409.
+     */
+    @Transactional
+    public ChallengeDto updateDuration(Long id, int minutes) {
+        Challenge c = find(id);
+        switch (c.getStatus()) {
+            case ASSIGNED -> c.setDurationMinutes(minutes);
+            case IN_PROGRESS -> {
+                Instant now = Instant.now();
+                if (now.isAfter(c.getDeadlineAt().plus(grace))) {
+                    throw ApiException.conflict("El tiempo de este reto ya termino; no se puede cambiar su duracion");
+                }
+                Instant newDeadline = c.getStartedAt().plus(Duration.ofMinutes(minutes));
+                if (!newDeadline.isAfter(now)) {
+                    long used = Duration.between(c.getStartedAt(), now).toMinutes();
+                    throw ApiException.badRequest("Con " + minutes + " minutos el limite ya habria pasado: el candidato "
+                            + "lleva " + used + " minutos. Indica una duracion mayor a " + used + " minutos.");
+                }
+                c.setDurationMinutes(minutes);
+                c.setDeadlineAt(newDeadline);
+            }
+            default -> throw ApiException.conflict("No se puede cambiar la duracion de un reto en estado " + c.getStatus());
+        }
+        log.info("Duracion del reto {} cambiada a {} min", c.getId(), minutes);
+        return dto(c);
     }
 
     // ---------- candidato: inicio (descarga) ----------
 
-    /** "Inicio Temp": arranca el temporizador de 3 horas. Idempotente si ya inicio. */
+    /** "Inicio Temp": arranca el temporizador del reto. Idempotente si ya inicio. Solo un reto en curso a la vez. */
     @Transactional
     public ChallengeDto start(Long id, AppUser actor) {
         Challenge c = ownChallenge(id, actor);
         if (c.getStatus() == ChallengeStatus.ASSIGNED) {
             Instant now = Instant.now();
+            for (Challenge other : challenges.findByCandidateAndStatus(actor, ChallengeStatus.IN_PROGRESS)) {
+                if (now.isAfter(other.getDeadlineAt().plus(grace))) {
+                    expire(other); // vencido pero el scheduler aun no lo marco
+                } else {
+                    throw ApiException.conflict("Ya tienes un reto en curso (" + other.getTrack() + " - "
+                            + other.getLevel() + "). Entregalo o espera a que termine su tiempo para iniciar otro.");
+                }
+            }
             c.setStartedAt(now);
-            c.setDeadlineAt(now.plus(duration));
+            c.setDeadlineAt(now.plus(Duration.ofMinutes(c.durationOr(defaultMinutes))));
             c.setStatus(ChallengeStatus.IN_PROGRESS);
         } else if (c.getStatus() != ChallengeStatus.IN_PROGRESS) {
             throw ApiException.conflict("Este reto ya no se puede iniciar (estado " + c.getStatus() + ")");
         }
-        return ChallengeDto.of(c);
+        return dto(c);
     }
 
     /** Descarga la carpeta de codigo; solo con el reto en curso y dentro del tiempo. */
@@ -145,7 +250,7 @@ public class ChallengeService {
 
     // ---------- candidato: fin (carga) ----------
 
-    /** "Fin Temp": carga de la carpeta de codigo dentro de las 3 horas. */
+    /** "Fin Temp": carga de la carpeta de codigo dentro del tiempo del reto. */
     @Transactional
     public ChallengeDto submit(Long id, MultipartFile file, AppUser actor) {
         Challenge c = ownChallenge(id, actor);
@@ -156,13 +261,7 @@ public class ChallengeService {
         if (now.isAfter(c.getDeadlineAt().plus(grace))) {
             throw new ApiException(HttpStatus.GONE, "El tiempo del reto ha terminado");
         }
-        if (file == null || file.isEmpty()) {
-            throw ApiException.badRequest("Debes adjuntar la carpeta de codigo en un archivo .zip");
-        }
-        String name = file.getOriginalFilename() == null ? "" : file.getOriginalFilename().toLowerCase(Locale.ROOT);
-        if (!name.endsWith(".zip")) {
-            throw ApiException.badRequest("El archivo debe ser un .zip");
-        }
+        checkZip(file);
         String path = submissionPath(c);
         try (InputStream in = file.getInputStream()) {
             storage.upload(path, in, file.getSize());
@@ -173,10 +272,11 @@ public class ChallengeService {
         c.setSubmittedAt(now);
         c.setStatus(ChallengeStatus.SUBMITTED);
 
-        notifications.notifyGhd(
-                "Reto entregado: " + c.getCandidate().getFullName() + " (" + c.getTrack() + " " + c.getLevel() + ")",
-                summary(c));
-        return ChallengeDto.of(c);
+        long used = Duration.between(c.getStartedAt(), now).toMinutes();
+        notifyGhdAfterCommit("[Retos tecnicos] Reto entregado: " + c.getCandidate().getFullName() + " - "
+                + TRACK_LABEL.get(c.getTrack()) + " " + LEVEL_LABEL.get(c.getLevel())
+                + " (" + used + " de " + c.durationOr(defaultMinutes) + " min)", summary(c));
+        return dto(c);
     }
 
     // ---------- calificacion ----------
@@ -194,7 +294,7 @@ public class ChallengeService {
         c.setGradedBy(actor);
         c.setGradedAt(Instant.now());
         c.setStatus(ChallengeStatus.GRADED);
-        return ChallengeDto.of(c);
+        return dto(c);
     }
 
     @Transactional(readOnly = true)
@@ -213,10 +313,7 @@ public class ChallengeService {
         if (!track.supports(level)) {
             throw ApiException.badRequest("El reto " + track + " no tiene nivel " + level);
         }
-        if (file == null || file.isEmpty() || file.getOriginalFilename() == null
-                || !file.getOriginalFilename().toLowerCase(Locale.ROOT).endsWith(".zip")) {
-            throw ApiException.badRequest("Adjunta un archivo .zip");
-        }
+        checkZip(file);
         try (InputStream in = file.getInputStream()) {
             storage.upload(templatePath(track, level), in, file.getSize());
         } catch (IOException e) {
@@ -230,17 +327,22 @@ public class ChallengeService {
     public int expireOverdue() {
         Instant cutoff = Instant.now().minus(grace);
         List<Challenge> overdue = challenges.findByStatusAndDeadlineAtBefore(ChallengeStatus.IN_PROGRESS, cutoff);
-        for (Challenge c : overdue) {
-            c.setStatus(ChallengeStatus.EXPIRED);
-            log.info("Reto {} vencido sin entrega ({})", c.getId(), c.getCandidate().getUsername());
-            notifications.notifyGhd(
-                    "Reto vencido sin entrega: " + c.getCandidate().getFullName() + " (" + c.getTrack() + " " + c.getLevel() + ")",
-                    summary(c));
-        }
+        overdue.forEach(this::expire);
         return overdue.size();
     }
 
+    private void expire(Challenge c) {
+        c.setStatus(ChallengeStatus.EXPIRED);
+        log.info("Reto {} vencido sin entrega ({})", c.getId(), c.getCandidate().getUsername());
+        notifyGhdAfterCommit("[Retos tecnicos] Reto vencido sin entrega: " + c.getCandidate().getFullName() + " - "
+                + TRACK_LABEL.get(c.getTrack()) + " " + LEVEL_LABEL.get(c.getLevel()), summary(c));
+    }
+
     // ---------- helpers ----------
+
+    private ChallengeDto dto(Challenge c) {
+        return ChallengeDto.of(c, defaultMinutes);
+    }
 
     private Challenge find(Long id) {
         return challenges.findById(id).orElseThrow(() -> ApiException.notFound("Reto no encontrado"));
@@ -260,27 +362,66 @@ public class ChallengeService {
         }
     }
 
+    /** Extension .zip, no vacio y firma ZIP ("PK") en los primeros bytes. */
+    private static void checkZip(MultipartFile file) {
+        if (file == null || file.isEmpty()) {
+            throw ApiException.badRequest("Adjunta un archivo .zip que no este vacio");
+        }
+        String name = file.getOriginalFilename() == null ? "" : file.getOriginalFilename().toLowerCase(Locale.ROOT);
+        if (!name.endsWith(".zip")) {
+            throw ApiException.badRequest("El archivo debe ser un .zip");
+        }
+        try (InputStream in = file.getInputStream()) {
+            byte[] head = in.readNBytes(2);
+            if (head.length < 2 || head[0] != 'P' || head[1] != 'K') {
+                throw ApiException.badRequest("El archivo no es un .zip valido");
+            }
+        } catch (IOException e) {
+            throw ApiException.badRequest("No se pudo leer el archivo enviado");
+        }
+    }
+
+    /** El correo sale despues del commit: si la transaccion falla no se avisa de algo que no ocurrio. */
+    private void notifyGhdAfterCommit(String subject, String body) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    notifications.notifyGhd(subject, body);
+                }
+            });
+        } else {
+            notifications.notifyGhd(subject, body);
+        }
+    }
+
     private String summary(Challenge c) {
+        int minutes = c.durationOr(defaultMinutes);
         StringBuilder sb = new StringBuilder();
         sb.append("Resumen del reto tecnico\n\n");
-        sb.append("Candidato : ").append(c.getCandidate().getFullName())
+        sb.append("Candidato     : ").append(c.getCandidate().getFullName())
                 .append(" (").append(c.getCandidate().getUsername()).append(")\n");
-        sb.append("Reto      : ").append(c.getTrack()).append(" - ").append(c.getLevel()).append("\n");
-        sb.append("Estado    : ").append(c.getStatus()).append("\n");
-        sb.append("Asignado  : ").append(fmt.format(c.getAssignedAt())).append("\n");
+        sb.append("Modulo        : ").append(TRACK_LABEL.get(c.getTrack())).append("\n");
+        sb.append("Nivel         : ").append(LEVEL_LABEL.get(c.getLevel())).append("\n");
+        sb.append("Estado        : ").append(STATUS_LABEL.get(c.getStatus())).append("\n");
+        sb.append("Duracion      : ").append(minutes).append(" min\n");
+        sb.append("Asignado      : ").append(fmt.format(c.getAssignedAt())).append("\n");
         if (c.getStartedAt() != null) {
-            sb.append("Inicio    : ").append(fmt.format(c.getStartedAt())).append("\n");
-            sb.append("Limite    : ").append(fmt.format(c.getDeadlineAt())).append("\n");
+            sb.append("Inicio        : ").append(fmt.format(c.getStartedAt())).append("\n");
+            sb.append("Limite        : ").append(fmt.format(c.getDeadlineAt())).append("\n");
         }
         if (c.getSubmittedAt() != null) {
-            long mins = Duration.between(c.getStartedAt(), c.getSubmittedAt()).toMinutes();
-            sb.append("Entrega   : ").append(fmt.format(c.getSubmittedAt()))
-                    .append(" (").append(mins).append(" min de ").append(duration.toMinutes()).append(")\n");
-            sb.append("Archivo   : ").append(c.getSubmissionPath()).append("\n");
+            long used = Duration.between(c.getStartedAt(), c.getSubmittedAt()).toMinutes();
+            sb.append("Entrega       : ").append(fmt.format(c.getSubmittedAt())).append("\n");
+            sb.append("Tiempo usado  : ").append(used).append(" de ").append(minutes).append(" min\n");
+            sb.append("Archivo       : ").append(c.getSubmissionPath()).append("\n");
         } else {
-            sb.append("Entrega   : sin entrega\n");
+            sb.append("Entrega       : sin entrega (se agotaron los ").append(minutes).append(" min)\n");
         }
-        sb.append("\nPendiente de calificacion (APTO / NO APTO).");
+        sb.append("\nPendiente de calificacion (APTO / NO APTO).\n");
+        if (!baseUrl.isBlank()) {
+            sb.append("Revisalo en: ").append(baseUrl).append("/retos\n");
+        }
         return sb.toString();
     }
 }

@@ -11,6 +11,7 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.InputStreamResource;
 import org.springframework.http.ContentDisposition;
 import org.springframework.http.HttpHeaders;
@@ -19,6 +20,7 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
+import org.springframework.util.unit.DataSize;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -29,9 +31,20 @@ public class ChallengeController {
     private final ChallengeService challenges;
     private final UserService users;
 
-    public ChallengeController(ChallengeService challenges, UserService users) {
+    private final DataSize maxUpload;
+
+    public ChallengeController(ChallengeService challenges, UserService users,
+                               @Value("${spring.servlet.multipart.max-file-size:200MB}") DataSize maxUpload) {
         this.challenges = challenges;
         this.users = users;
+        this.maxUpload = maxUpload;
+    }
+
+    /** Limites que el frontend usa para validar antes de enviar (MAX_UPLOAD, duraciones). */
+    @GetMapping("/settings")
+    public SettingsDto settings() {
+        return new SettingsDto(maxUpload.toBytes(), challenges.defaultMinutes(),
+                Dtos.MIN_DURATION_MINUTES, Dtos.MAX_DURATION_MINUTES);
     }
 
     /** Tipos de reto y niveles que admite cada uno (DevOps: 4 niveles, Data: 3). */
@@ -56,11 +69,21 @@ public class ChallengeController {
 
     // ---- GHD ----
 
+    /**
+     * Asigna. Con el formato anterior ({@code level}) responde un objeto; con {@code levels} responde una lista.
+     */
     @PostMapping("/challenges")
     @PreAuthorize("hasAnyRole('GHD','ADMIN')")
-    public ResponseEntity<ChallengeDto> assign(@Valid @RequestBody AssignRequest req, Authentication auth) {
-        ChallengeDto dto = challenges.assign(req, users.byUsername(auth.getName()));
-        return ResponseEntity.status(HttpStatus.CREATED).body(dto);
+    public ResponseEntity<Object> assign(@Valid @RequestBody AssignRequest req, Authentication auth) {
+        List<ChallengeDto> dtos = challenges.assign(req, users.byUsername(auth.getName()));
+        Object body = req.levels() == null ? dtos.get(0) : dtos;
+        return ResponseEntity.status(HttpStatus.CREATED).body(body);
+    }
+
+    @PatchMapping("/challenges/{id}/duration")
+    @PreAuthorize("hasAnyRole('GHD','ADMIN')")
+    public ChallengeDto updateDuration(@PathVariable Long id, @Valid @RequestBody DurationRequest req) {
+        return challenges.updateDuration(id, req.durationMinutes());
     }
 
     // ---- candidato ----

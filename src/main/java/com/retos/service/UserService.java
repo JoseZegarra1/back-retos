@@ -7,6 +7,7 @@ import com.retos.web.ApiException;
 import com.retos.web.Dtos.*;
 import java.security.SecureRandom;
 import java.util.List;
+import java.util.Locale;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -19,10 +20,12 @@ public class UserService {
 
     private final UserRepository users;
     private final PasswordEncoder encoder;
+    private final EmailDomainChecker domainChecker;
 
-    public UserService(UserRepository users, PasswordEncoder encoder) {
+    public UserService(UserRepository users, PasswordEncoder encoder, EmailDomainChecker domainChecker) {
         this.users = users;
         this.encoder = encoder;
+        this.domainChecker = domainChecker;
     }
 
     public AppUser byUsername(String username) {
@@ -45,13 +48,20 @@ public class UserService {
         if (users.existsByUsername(req.username())) {
             throw ApiException.conflict("El usuario '" + req.username() + "' ya existe");
         }
+        String email = req.email() == null || req.email().isBlank() ? null : req.email().trim().toLowerCase(Locale.ROOT);
+        if (email == null && role != Role.USER) {
+            throw ApiException.badRequest("El correo es obligatorio para usuarios con rol " + role);
+        }
+        if (email != null && !domainChecker.canReceiveMail(email)) {
+            throw ApiException.badRequest("El dominio del correo '" + email + "' no existe o no recibe correo");
+        }
         boolean generated = req.password() == null || req.password().isBlank();
         String rawPassword = generated ? randomPassword(10) : req.password();
 
         AppUser u = new AppUser();
         u.setUsername(req.username());
         u.setFullName(req.fullName());
-        u.setEmail(req.email());
+        u.setEmail(email);
         u.setRole(role);
         u.setPasswordHash(encoder.encode(rawPassword));
         u.setMustChangePassword(true);
@@ -70,6 +80,9 @@ public class UserService {
     public void changePassword(AppUser user, ChangePasswordRequest req) {
         if (!encoder.matches(req.currentPassword(), user.getPasswordHash())) {
             throw ApiException.badRequest("La contrasena actual no es correcta");
+        }
+        if (encoder.matches(req.newPassword(), user.getPasswordHash())) {
+            throw ApiException.badRequest("La nueva contrasena debe ser distinta de la actual");
         }
         user.setPasswordHash(encoder.encode(req.newPassword()));
         user.setMustChangePassword(false);

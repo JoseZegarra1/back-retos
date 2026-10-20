@@ -5,9 +5,9 @@ spring:
   application:
     name: retos-tecnicos
   datasource:
-    url: ${DB_URL:jdbc:postgresql://retos-pg-jose.postgres.database.azure.com:5432/retos?sslmode=require}
-    username: ${DB_USER:retosadmin}
-    password: ${DB_PASSWORD:admin12345}
+    url: ${DB_URL:jdbc:h2:mem:retos;DB_CLOSE_DELAY=-1}
+    username: ${DB_USER:sa}
+    password: ${DB_PASSWORD:}
   jpa:
     hibernate:
       ddl-auto: ${DDL_AUTO:update}
@@ -16,14 +16,21 @@ spring:
     multipart:
       max-file-size: ${MAX_UPLOAD:200MB}
       max-request-size: ${MAX_UPLOAD:200MB}
+  # SMTP (por defecto Brevo: smtp-relay.brevo.com:587). Sin SMTP_HOST el resumen solo se escribe en el log.
   mail:
-    host: ${SMTP_HOST:}
+    host: ${SMTP_HOST:smtp-relay.sendinblue.com}
     port: ${SMTP_PORT:587}
-    username: ${SMTP_USER:}
-    password: ${SMTP_PASSWORD:}
+    username: ${SMTP_USER:bf1baa001@smtp-brevo.com}
+    password: ${SMTP_PASSWORD:xsmtpsib-eaab4769af734144fccde6691b65327b33530ac16ca67fbfa0db9198a831eebf-3KAFivG5dW8hEqUS}
+    default-encoding: UTF-8
     properties:
       mail.smtp.auth: true
-      mail.smtp.starttls.enable: true
+      mail.smtp.starttls.enable: ${SMTP_STARTTLS:true}
+      mail.smtp.starttls.required: ${SMTP_STARTTLS:true}
+      # En milisegundos: un SMTP caido no deja hilos colgados
+      mail.smtp.connectiontimeout: 10000
+      mail.smtp.timeout: 10000
+      mail.smtp.writetimeout: 10000
 
 storage:
   type: ${STORAGE_TYPE:azure}
@@ -35,6 +42,10 @@ storage:
 
 app:
   timezone: America/Lima
+  # URL publica del frontend; se usa para el enlace a la pantalla de Retos en el correo
+  base-url: ${APP_BASE_URL:http://localhost:4200}
+  validation:
+    email-mx-check: ${EMAIL_MX_CHECK:false}
   jwt:
     secret: ${JWT_SECRET:cambia-este-secreto-por-uno-de-minimo-32-caracteres!}
     ttl-minutes: 480
@@ -45,7 +56,7 @@ app:
     grace-seconds: 60
     expire-check-ms: 30000
   notification:
-    from: ${MAIL_FROM:no-reply@retos.local}
+    from: ${MAIL_FROM:jose.zegarra@vallegrande.edu.pe}
     extra-recipients: ${GHD_EXTRA_EMAILS:}
   seed:
     admin-password: ${ADMIN_PASSWORD:Admin123!}
