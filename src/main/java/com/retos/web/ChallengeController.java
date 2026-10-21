@@ -109,7 +109,7 @@ public class ChallengeController {
     // ---- calificacion ----
 
     @PostMapping("/challenges/{id}/grade")
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('GHD','ADMIN')")
     public ChallengeDto grade(@PathVariable Long id, @Valid @RequestBody GradeRequest req, Authentication auth) {
         return challenges.grade(id, req, users.byUsername(auth.getName()));
     }
