@@ -40,10 +40,6 @@ public class ChallengeService {
     private static final Map<Level, String> LEVEL_LABEL = Map.of(
             Level.PRINCIPIANTE, "Principiante", Level.COMPETENTE, "Competente",
             Level.PROFICIENTE, "Proficiente", Level.MASTER, "Master");
-    private static final Map<ChallengeStatus, String> STATUS_LABEL = Map.of(
-            ChallengeStatus.ASSIGNED, "Asignado", ChallengeStatus.IN_PROGRESS, "En curso",
-            ChallengeStatus.SUBMITTED, "Entregado", ChallengeStatus.EXPIRED, "Vencido sin entrega",
-            ChallengeStatus.GRADED, "Calificado");
 
     public record DownloadFile(InputStream stream, String filename) {}
 
@@ -54,6 +50,7 @@ public class ChallengeService {
     private final int defaultMinutes;
     private final Duration grace;
     private final DateTimeFormatter fmt;
+    private final String zone;
     private final String baseUrl;
 
     public ChallengeService(ChallengeRepository challenges, UserRepository users, StorageService storage,
@@ -70,6 +67,7 @@ public class ChallengeService {
         this.grace = Duration.ofSeconds(graceSeconds);
         this.fmt = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss", Locale.forLanguageTag("es"))
                 .withZone(ZoneId.of(zone));
+        this.zone = zone;
         this.baseUrl = baseUrl == null ? "" : baseUrl.replaceAll("/+$", "");
     }
 
@@ -253,7 +251,9 @@ public class ChallengeService {
     /** "Fin Temp": carga de la carpeta de codigo dentro del tiempo del reto. */
     @Transactional
     public ChallengeDto submit(Long id, MultipartFile file, AppUser actor) {
-        Challenge c = ownChallenge(id, actor);
+        // Fila bloqueada mientras se sube el .zip: si el vencimiento corre a la vez, espera y ve SUBMITTED
+        Challenge c = challenges.findByIdForUpdate(id).orElseThrow(() -> ApiException.notFound("Reto no encontrado"));
+        checkOwner(c, actor);
         if (c.getStatus() != ChallengeStatus.IN_PROGRESS) {
             throw ApiException.conflict("El reto no esta en curso (estado " + c.getStatus() + ")");
         }
@@ -272,10 +272,7 @@ public class ChallengeService {
         c.setSubmittedAt(now);
         c.setStatus(ChallengeStatus.SUBMITTED);
 
-        long used = Duration.between(c.getStartedAt(), now).toMinutes();
-        notifyGhdAfterCommit("[Retos tecnicos] Reto entregado: " + c.getCandidate().getFullName() + " - "
-                + TRACK_LABEL.get(c.getTrack()) + " " + LEVEL_LABEL.get(c.getLevel())
-                + " (" + used + " de " + c.durationOr(defaultMinutes) + " min)", summary(c));
+        notifyGhdAfterCommit("Reto entregado - " + headline(c), submittedBody(c));
         return dto(c);
     }
 
@@ -332,10 +329,14 @@ public class ChallengeService {
     }
 
     private void expire(Challenge c) {
+        // UPDATE condicionado: si el candidato entrego (aun dentro de la gracia), no se vence ni se avisa
+        if (challenges.changeStatus(c.getId(), ChallengeStatus.IN_PROGRESS, ChallengeStatus.EXPIRED) == 0) {
+            log.info("Reto {} no se vence: ya no esta en curso", c.getId());
+            return;
+        }
         c.setStatus(ChallengeStatus.EXPIRED);
         log.info("Reto {} vencido sin entrega ({})", c.getId(), c.getCandidate().getUsername());
-        notifyGhdAfterCommit("[Retos tecnicos] Reto vencido sin entrega: " + c.getCandidate().getFullName() + " - "
-                + TRACK_LABEL.get(c.getTrack()) + " " + LEVEL_LABEL.get(c.getLevel()), summary(c));
+        notifyGhdAfterCommit("Tiempo vencido sin entrega - " + headline(c), expiredBody(c));
     }
 
     // ---------- helpers ----------
@@ -350,10 +351,14 @@ public class ChallengeService {
 
     private Challenge ownChallenge(Long id, AppUser actor) {
         Challenge c = find(id);
+        checkOwner(c, actor);
+        return c;
+    }
+
+    private static void checkOwner(Challenge c, AppUser actor) {
         if (!c.getCandidate().getId().equals(actor.getId())) {
             throw ApiException.forbidden("Este reto no esta asignado a tu usuario");
         }
-        return c;
     }
 
     private void checkCanView(Challenge c, AppUser actor) {
@@ -395,33 +400,59 @@ public class ChallengeService {
         }
     }
 
-    private String summary(Challenge c) {
-        int minutes = c.durationOr(defaultMinutes);
-        StringBuilder sb = new StringBuilder();
-        sb.append("Resumen del reto tecnico\n\n");
-        sb.append("Candidato     : ").append(c.getCandidate().getFullName())
-                .append(" (").append(c.getCandidate().getUsername()).append(")\n");
-        sb.append("Modulo        : ").append(TRACK_LABEL.get(c.getTrack())).append("\n");
-        sb.append("Nivel         : ").append(LEVEL_LABEL.get(c.getLevel())).append("\n");
-        sb.append("Estado        : ").append(STATUS_LABEL.get(c.getStatus())).append("\n");
-        sb.append("Duracion      : ").append(minutes).append(" min\n");
-        sb.append("Asignado      : ").append(fmt.format(c.getAssignedAt())).append("\n");
-        if (c.getStartedAt() != null) {
-            sb.append("Inicio        : ").append(fmt.format(c.getStartedAt())).append("\n");
-            sb.append("Limite        : ").append(fmt.format(c.getDeadlineAt())).append("\n");
+    // ---------- correos a GHD ----------
+
+    /** "{Nombre completo} ({Modulo} · {Nivel})", parte comun de ambos asuntos. */
+    private String headline(Challenge c) {
+        return c.getCandidate().getFullName() + " (" + reto(c) + ")";
+    }
+
+    String submittedBody(Challenge c) {
+        long used = Duration.between(c.getStartedAt(), c.getSubmittedAt()).toMinutes();
+        return "El candidato ha terminado la evaluación y entregó su archivo .zip. "
+                + "Ya puedes descargarlo y calificarlo desde la plataforma.\n\n"
+                + candidateLines(c)
+                + line("Fecha de entrega", fmt.format(c.getSubmittedAt()) + " (" + zone + ")")
+                + line("Tiempo utilizado", formatMinutes(used))
+                + line("Duración asignada", formatMinutes(c.durationOr(defaultMinutes)))
+                + footer();
+    }
+
+    String expiredBody(Challenge c) {
+        return "El tiempo del reto venció y el candidato NO entregó su solución.\n\n"
+                + candidateLines(c)
+                + line("Duración asignada", formatMinutes(c.durationOr(defaultMinutes)))
+                + line("Hora de inicio", fmt.format(c.getStartedAt()) + " (" + zone + ")")
+                + line("Hora límite", fmt.format(c.getDeadlineAt()) + " (" + zone + ")")
+                + footer();
+    }
+
+    private String candidateLines(Challenge c) {
+        return line("Candidato", c.getCandidate().getFullName() + " (usuario: " + c.getCandidate().getUsername() + ")")
+                + line("Reto", reto(c));
+    }
+
+    private static String reto(Challenge c) {
+        return TRACK_LABEL.get(c.getTrack()) + " · " + LEVEL_LABEL.get(c.getLevel());
+    }
+
+    private static String line(String label, String value) {
+        return String.format(Locale.ROOT, "%-18s: %s\n", label, value);
+    }
+
+    private String footer() {
+        return baseUrl.isBlank() ? "" : "\nPlataforma: " + baseUrl + "/retos\n";
+    }
+
+    /** 85 -> "1 h 25 min"; 180 -> "3 h"; 0 -> "menos de 1 min". */
+    static String formatMinutes(long minutes) {
+        if (minutes < 1) {
+            return "menos de 1 min";
         }
-        if (c.getSubmittedAt() != null) {
-            long used = Duration.between(c.getStartedAt(), c.getSubmittedAt()).toMinutes();
-            sb.append("Entrega       : ").append(fmt.format(c.getSubmittedAt())).append("\n");
-            sb.append("Tiempo usado  : ").append(used).append(" de ").append(minutes).append(" min\n");
-            sb.append("Archivo       : ").append(c.getSubmissionPath()).append("\n");
-        } else {
-            sb.append("Entrega       : sin entrega (se agotaron los ").append(minutes).append(" min)\n");
+        long h = minutes / 60, m = minutes % 60;
+        if (h == 0) {
+            return m + " min";
         }
-        sb.append("\nPendiente de calificacion (APTO / NO APTO).\n");
-        if (!baseUrl.isBlank()) {
-            sb.append("Revisalo en: ").append(baseUrl).append("/retos\n");
-        }
-        return sb.toString();
+        return m == 0 ? h + " h" : h + " h " + m + " min";
     }
 }

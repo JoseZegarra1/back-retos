@@ -35,6 +35,7 @@ public class NotificationService {
     private final int smtpPort;
     private final String smtpUser;
     private final List<String> extraRecipients;
+    private final boolean enabled;
 
     public NotificationService(ObjectProvider<JavaMailSender> mailSender,
                                UserRepository users,
@@ -42,7 +43,9 @@ public class NotificationService {
                                @Value("${app.notification.extra-recipients:}") List<String> extraRecipients,
                                @Value("${spring.mail.host:}") String smtpHost,
                                @Value("${spring.mail.port:587}") int smtpPort,
-                               @Value("${spring.mail.username:}") String smtpUser) {
+                               @Value("${spring.mail.username:}") String smtpUser,
+                               @Value("${app.notification.enabled:true}") boolean enabled) {
+        this.enabled = enabled;
         this.smtpHost = smtpHost;
         this.smtpPort = smtpPort;
         this.smtpUser = smtpUser;
@@ -52,25 +55,37 @@ public class NotificationService {
         this.extraRecipients = extraRecipients;
     }
 
-    /** Asincrono: un SMTP lento o caido nunca bloquea ni hace fallar la entrega o el vencimiento. */
+    /**
+     * Un solo correo por evento, con todos los GHD activos con correo (mas GHD_EXTRA_EMAILS) como destinatarios.
+     * Asincrono: un SMTP lento, caido o deshabilitado nunca bloquea ni hace fallar la entrega o el vencimiento.
+     */
     @Async
     public void notifyGhd(String subject, String body) {
         List<String> to = new ArrayList<>();
         for (AppUser u : users.findByRoleAndActiveTrue(Role.GHD)) {
             if (u.getEmail() != null && !u.getEmail().isBlank()) {
-                to.add(u.getEmail());
+                to.add(u.getEmail().trim());
             }
+        }
+        if (to.isEmpty()) {
+            log.warn("No hay usuarios GHD activos con correo registrado para el aviso: {}", subject);
         }
         extraRecipients.stream().map(String::trim).filter(s -> !s.isBlank()).forEach(to::add);
 
+        if (!enabled) {
+            log.info("Envio de correos deshabilitado (MAIL_ENABLED=false). No se envia a {}: {}\n{}",
+                    to.stream().distinct().toList(), subject, body);
+            return;
+        }
         JavaMailSender sender = mailSender.getIfAvailable();
         if (sender == null || smtpHost.isBlank() || to.isEmpty()) {
-            log.warn("Correo NO enviado (SMTP sin configurar o sin destinatarios GHD). Asunto: {}\n{}", subject, body);
+            log.warn("Correo NO enviado (SMTP sin configurar o sin destinatarios). Asunto: {}\n{}", subject, body);
             return;
         }
         try {
-            sender.send(message(to.stream().distinct().toArray(String[]::new), subject, body));
-            log.info("Correo de resumen enviado a {}", to);
+            List<String> recipients = to.stream().distinct().toList();
+            sender.send(message(recipients.toArray(String[]::new), subject, body));
+            log.info("Correo '{}' enviado a {}", subject, recipients);
         } catch (Exception e) {
             log.error("No se pudo enviar el correo de resumen: {}", readable(e), e);
         }
@@ -78,6 +93,9 @@ public class NotificationService {
 
     /** Sincrono, para POST /api/notifications/test: lanza ApiException con el error SMTP legible. */
     public void sendTest(String to) {
+        if (!enabled) {
+            throw ApiException.badRequest("El envio de correos esta deshabilitado (MAIL_ENABLED=false)");
+        }
         JavaMailSender sender = mailSender.getIfAvailable();
         if (sender == null || smtpHost.isBlank()) {
             throw ApiException.badRequest("SMTP sin configurar: define SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD y MAIL_FROM");

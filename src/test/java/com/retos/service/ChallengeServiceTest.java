@@ -9,9 +9,11 @@ import com.retos.web.Dtos.*;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.http.HttpStatus;
+import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.Duration;
@@ -21,7 +23,9 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.startsWith;
 import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
@@ -234,5 +238,87 @@ class ChallengeServiceTest {
 
         ApiException ex = assertThrows(ApiException.class, () -> challengeService.updateDuration(1L, 200));
         assertEquals(HttpStatus.CONFLICT, ex.getStatus());
+    }
+
+    // ---------- correos a GHD ----------
+
+    private Challenge running(long id, Duration sinceStart) {
+        Challenge c = challenge(id, Level.PRINCIPIANTE, ChallengeStatus.IN_PROGRESS);
+        Instant started = Instant.now().minus(sinceStart);
+        c.setStartedAt(started);
+        c.setDeadlineAt(started.plus(Duration.ofMinutes(180)));
+        return c;
+    }
+
+    private static MockMultipartFile zip() {
+        return new MockMultipartFile("file", "solucion.zip", "application/zip", new byte[] {'P', 'K', 3, 4});
+    }
+
+    @Test
+    void submitSendsDeliveredMailToGhd() {
+        Challenge c = running(1L, Duration.ofMinutes(85));
+        when(challengeRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(c));
+
+        challengeService.submit(1L, zip(), candidate);
+
+        ArgumentCaptor<String> subject = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<String> body = ArgumentCaptor.forClass(String.class);
+        verify(notificationService).notifyGhd(subject.capture(), body.capture());
+        assertEquals("Reto entregado - Candidato Test (DevOps · Principiante)", subject.getValue());
+        assertTrue(body.getValue().startsWith("El candidato ha terminado la evaluación y entregó su archivo .zip. "
+                + "Ya puedes descargarlo y calificarlo desde la plataforma."));
+        assertTrue(body.getValue().contains("Candidato Test (usuario: candidato.test)"));
+        assertTrue(body.getValue().contains("Tiempo utilizado  : 1 h 25 min"));
+        assertTrue(body.getValue().contains("Duración asignada : 3 h"));
+        assertTrue(body.getValue().contains("(America/Lima)"));
+    }
+
+    @Test
+    void submitWithinGraceSendsOnlyDeliveredMail() {
+        Challenge c = running(1L, Duration.ofMinutes(180).plusSeconds(30)); // limite + 30 s, gracia de 60 s
+        when(challengeRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(c));
+
+        challengeService.submit(1L, zip(), candidate);
+
+        assertEquals(ChallengeStatus.SUBMITTED, c.getStatus());
+        verify(notificationService).notifyGhd(startsWith("Reto entregado - "), anyString());
+        verify(notificationService, never()).notifyGhd(startsWith("Tiempo vencido"), anyString());
+    }
+
+    @Test
+    void expiredWithoutSubmissionSendsExpiredMail() {
+        Challenge c = running(1L, Duration.ofMinutes(185));
+        when(challengeRepository.findByStatusAndDeadlineAtBefore(eq(ChallengeStatus.IN_PROGRESS), any())).thenReturn(List.of(c));
+        when(challengeRepository.changeStatus(1L, ChallengeStatus.IN_PROGRESS, ChallengeStatus.EXPIRED)).thenReturn(1);
+
+        challengeService.expireOverdue();
+
+        ArgumentCaptor<String> body = ArgumentCaptor.forClass(String.class);
+        verify(notificationService).notifyGhd(eq("Tiempo vencido sin entrega - Candidato Test (DevOps · Principiante)"), body.capture());
+        assertTrue(body.getValue().startsWith("El tiempo del reto venció y el candidato NO entregó su solución."));
+        assertTrue(body.getValue().contains("Hora de inicio"));
+        assertTrue(body.getValue().contains("Hora límite"));
+        assertEquals(ChallengeStatus.EXPIRED, c.getStatus());
+    }
+
+    @Test
+    void expireSkipsChallengeAlreadySubmitted() {
+        Challenge c = running(1L, Duration.ofMinutes(185));
+        when(challengeRepository.findByStatusAndDeadlineAtBefore(eq(ChallengeStatus.IN_PROGRESS), any())).thenReturn(List.of(c));
+        // la entrega se confirmo entre la consulta y el UPDATE
+        when(challengeRepository.changeStatus(1L, ChallengeStatus.IN_PROGRESS, ChallengeStatus.EXPIRED)).thenReturn(0);
+
+        challengeService.expireOverdue();
+
+        verifyNoInteractions(notificationService);
+        assertEquals(ChallengeStatus.IN_PROGRESS, c.getStatus());
+    }
+
+    @Test
+    void formatsMinutes() {
+        assertEquals("menos de 1 min", ChallengeService.formatMinutes(0));
+        assertEquals("45 min", ChallengeService.formatMinutes(45));
+        assertEquals("3 h", ChallengeService.formatMinutes(180));
+        assertEquals("1 h 25 min", ChallengeService.formatMinutes(85));
     }
 }
